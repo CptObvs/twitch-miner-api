@@ -45,11 +45,14 @@ async def tail_log(
         history_lines: Number of historical lines to send (default: complete file)
     """
     # Wait for log file to exist (might take a moment after starting)
+    sent_waiting = False
     for _ in range(30):  # Wait up to 30 seconds
         log_file = get_instance_log_file(instance_id)
         if log_file is not None and log_file.exists():
             break
-        yield "[system] Waiting for miner to produce output...\n"
+        if not sent_waiting:
+            yield "[system] Waiting for miner to produce output...\n"
+            sent_waiting = True
         await asyncio.sleep(1)
     else:
         yield "[system] Log file not found. Is the miner running?\n"

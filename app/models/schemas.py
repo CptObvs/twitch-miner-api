@@ -75,10 +75,15 @@ class UpdateInviteLimitRequest(BaseModel):
 class InstanceCreate(BaseModel):
     twitch_username: str
     streamers: list[str] = Field(default_factory=list)
+    enable_analytics: bool = False
 
 
 class StreamersUpdate(BaseModel):
     streamers: list[str]
+
+
+class AnalyticsUpdate(BaseModel):
+    enable_analytics: bool
 
 
 class InstanceResponse(BaseModel):
@@ -88,6 +93,8 @@ class InstanceResponse(BaseModel):
     status: InstanceState
     pid: int | None = None
     streamers: list[str] = Field(default_factory=list)
+    enable_analytics: bool = False
+    analytics_port: int | None = None
     created_at: datetime
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None

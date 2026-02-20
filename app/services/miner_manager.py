@@ -50,6 +50,8 @@ class MinerProcessManager:
     def __init__(self):
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._watch_tasks: dict[str, asyncio.Task] = {}
+        self._analytics_ports: dict[str, int] = {}  # instance_id -> port mapping
+        self._next_analytics_port = 5000
 
     @staticmethod
     def _pid_exists(pid: int | None) -> bool:
@@ -80,11 +82,27 @@ class MinerProcessManager:
             await asyncio.sleep(0.2)
         return not self._pid_exists(pid)
 
+    def _allocate_analytics_port(self, instance_id: str) -> int:
+        """Allocate a unique port for analytics."""
+        if instance_id in self._analytics_ports:
+            return self._analytics_ports[instance_id]
+        
+        port = self._next_analytics_port
+        self._analytics_ports[instance_id] = port
+        self._next_analytics_port += 1
+        return port
+
+    def _release_analytics_port(self, instance_id: str) -> None:
+        """Release the analytics port."""
+        self._analytics_ports.pop(instance_id, None)
+
     def _generate_run_script(
         self,
         instance_dir: Path,
         twitch_username: str,
         streamers: list[str],
+        enable_analytics: bool = False,
+        analytics_port: int | None = None,
     ) -> Path:
         """Create a run.py based on the official example.py with sensible defaults."""
         streamer_lines = "\n".join(f'        "{s}",' for s in streamers)
@@ -97,6 +115,10 @@ class MinerProcessManager:
                 f'import sys\n'
                 f'sys.path.insert(0, "{expanded_path}")\n\n'
             )
+
+        analytics_call = ""
+        if enable_analytics and analytics_port:
+            analytics_call = f'twitch_miner.analytics(host="0.0.0.0", port={analytics_port}, refresh=5, days_ago=7)\n'
 
         script = (
             "# -*- coding: utf-8 -*-\n"
@@ -120,7 +142,7 @@ class MinerProcessManager:
             "        Priority.DROPS,\n"
             "        Priority.ORDER,\n"
             "    ],\n"
-            "    enable_analytics=False,\n"
+            f"    enable_analytics={str(enable_analytics)},\n"
             "    disable_ssl_cert_verification=False,\n"
             "    logger_settings=LoggerSettings(\n"
             "        save=True,\n"
@@ -163,6 +185,7 @@ class MinerProcessManager:
             "    ),\n"
             ")\n"
             "\n"
+            f"{analytics_call}"
             "twitch_miner.mine(\n"
             "    [\n"
             f"{streamer_lines}\n"
@@ -190,6 +213,7 @@ class MinerProcessManager:
         *,
         status: InstanceState,
         pid: int | None = None,
+        analytics_port: int | None = None,
         set_last_started_at: bool = False,
         set_last_stopped_at: bool = False,
         db_session: AsyncSession | None = None,
@@ -204,6 +228,8 @@ class MinerProcessManager:
 
             inst.status = status
             inst.pid = pid
+            if analytics_port is not None:
+                inst.analytics_port = analytics_port
             if set_last_started_at:
                 inst.last_started_at = datetime.now(timezone.utc)
             if set_last_stopped_at:
@@ -221,6 +247,8 @@ class MinerProcessManager:
 
             inst.status = status
             inst.pid = pid
+            if analytics_port is not None:
+                inst.analytics_port = analytics_port
             if set_last_started_at:
                 inst.last_started_at = datetime.now(timezone.utc)
             if set_last_stopped_at:
@@ -323,19 +351,29 @@ class MinerProcessManager:
         instance_id: str,
         twitch_username: str,
         streamers: list[str],
+        enable_analytics: bool = False,
         db_session: AsyncSession | None = None,
     ) -> int:
         """
         Start the miner subprocess. Returns the OS PID.
         Raises RuntimeError if already running.
         """
+        # Allocate analytics port if needed
+        analytics_port = None
+        if enable_analytics:
+            analytics_port = self._allocate_analytics_port(instance_id)
+
         reserved = await self._reserve_instance_start(instance_id, db_session=db_session)
         if not reserved:
+            self._release_analytics_port(instance_id)
             raise RuntimeError(f"Instance {instance_id} is already running or transitioning")
+
+        # Analytics run on allocated port
+        analytics_port = analytics_port if enable_analytics else None
 
         instance_dir = self._ensure_instance_dir(instance_id)
         run_script = self._generate_run_script(
-            instance_dir, twitch_username, streamers
+            instance_dir, twitch_username, streamers, enable_analytics, analytics_port
         )
 
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
@@ -351,6 +389,7 @@ class MinerProcessManager:
                 **kwargs,
             )
         except Exception:
+            self._release_analytics_port(instance_id)
             await self._update_instance_status(
                 instance_id,
                 status=InstanceState.STOPPED,
@@ -369,6 +408,7 @@ class MinerProcessManager:
             instance_id,
             status=InstanceState.RUNNING,
             pid=process.pid,
+            analytics_port=analytics_port,
             db_session=db_session,
         )
 
@@ -385,11 +425,13 @@ class MinerProcessManager:
             logger.info(f"Miner instance {instance_id} exited with code {process.returncode}")
             self._processes.pop(instance_id, None)
             self._watch_tasks.pop(instance_id, None)
+            self._release_analytics_port(instance_id)
 
             await self._update_instance_status(
                 instance_id,
                 status=InstanceState.STOPPED,
                 pid=None,
+                analytics_port=None,
                 set_last_stopped_at=True,
             )
         except Exception as e:
@@ -492,11 +534,13 @@ class MinerProcessManager:
 
         self._processes.pop(instance_id, None)
         self._watch_tasks.pop(instance_id, None)
+        self._release_analytics_port(instance_id)
 
         await self._update_instance_status(
             instance_id,
             status=InstanceState.STOPPED,
             pid=None,
+            analytics_port=None,
             set_last_stopped_at=True,
             db_session=db_session,
         )

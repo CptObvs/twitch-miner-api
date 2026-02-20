@@ -19,6 +19,7 @@ from app.models.schemas import (
     InstanceStatus,
     StreamerPointsSnapshot,
     StreamersUpdate,
+    AnalyticsUpdate,
 )
 from app.services.auth import get_current_user
 from app.services.miner_manager import miner_manager
@@ -90,6 +91,8 @@ def _instance_to_response(instance: MinerInstance) -> InstanceResponse:
         status=instance.status,
         pid=instance.pid,
         streamers=streamers,
+        enable_analytics=instance.enable_analytics,
+        analytics_port=instance.analytics_port,
         created_at=instance.created_at,
         last_started_at=instance.last_started_at,
         last_stopped_at=instance.last_stopped_at,
@@ -129,7 +132,11 @@ async def create_instance(
                 detail=f"Maximum {settings.MAX_INSTANCES_PER_USER} instances allowed for user role"
             )
     
-    instance = MinerInstance(user_id=current_user.id, twitch_username=data.twitch_username)
+    instance = MinerInstance(
+        user_id=current_user.id,
+        twitch_username=data.twitch_username,
+        enable_analytics=data.enable_analytics,
+    )
     db.add(instance)
     await db.commit()
     await db.refresh(instance)
@@ -137,13 +144,15 @@ async def create_instance(
     _write_config(instance.id, {
         "twitch_username": data.twitch_username,
         "streamers": data.streamers,
+        "enable_analytics": data.enable_analytics,
     })
 
     logger.info(
-        "Instanz erstellt: id=%s, user_id=%s, twitch_username=%s",
+        "Instanz erstellt: id=%s, user_id=%s, twitch_username=%s, analytics=%s",
         instance.id,
         current_user.id,
         data.twitch_username,
+        data.enable_analytics,
     )
 
     return _instance_to_response(instance)
@@ -290,6 +299,68 @@ async def update_streamers(
     return _instance_to_response(instance)
 
 
+@router.put("/{instance_id}/analytics", response_model=InstanceResponse)
+async def update_analytics(
+    instance_id: str,
+    data: AnalyticsUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    Enable or disable analytics for an instance.
+    If the instance is currently running, it will be automatically
+    restarted so the change takes effect immediately.
+    """
+    instance = await _get_user_instance(instance_id, current_user, db)
+
+    old_value = instance.enable_analytics
+    needs_restart = (
+        old_value != data.enable_analytics
+        and miner_manager.is_process_tracked(instance_id)
+    )
+
+    # Update database
+    instance.enable_analytics = data.enable_analytics
+    await db.commit()
+
+    # Update config
+    config = _read_config(instance_id)
+    config["enable_analytics"] = data.enable_analytics
+    _write_config(instance_id, config)
+
+    logger.info(
+        "Analytics aktualisiert: id=%s, enabled=%s",
+        instance_id,
+        data.enable_analytics,
+    )
+
+    # Auto-restart if instance is running so analytics actually stops/starts
+    if needs_restart:
+        logger.info(
+            "Auto-Restart wegen Analytics-Änderung: id=%s, %s -> %s",
+            instance_id,
+            old_value,
+            data.enable_analytics,
+        )
+        await _stop_instance_with_db(instance_id, db)
+        await db.refresh(instance)
+
+        try:
+            await miner_manager.start(
+                instance_id=instance_id,
+                twitch_username=config["twitch_username"],
+                streamers=config["streamers"],
+                enable_analytics=data.enable_analytics,
+                db_session=db,
+            )
+        except RuntimeError as e:
+            logger.error("Auto-Restart fehlgeschlagen: id=%s, fehler=%s", instance_id, str(e))
+
+        await db.refresh(instance)
+
+    return _instance_to_response(instance)
+
+
 @router.post("/{instance_id}/start", response_model=InstanceStatus)
 async def start_instance(
     instance_id: str,
@@ -323,11 +394,13 @@ async def start_instance(
         )
 
     try:
+        enable_analytics = config.get("enable_analytics", instance.enable_analytics)
         logger.info("Start angefordert: id=%s, user_id=%s", instance_id, current_user.id)
         pid = await miner_manager.start(
             instance_id=instance_id,
             twitch_username=config["twitch_username"],
             streamers=config["streamers"],
+            enable_analytics=enable_analytics,
             db_session=db,
         )
     except RuntimeError as e:
@@ -435,3 +508,23 @@ async def stream_logs(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.delete("/{instance_id}/logs")
+async def delete_logs(
+    instance_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    Delete all log files for a miner instance.
+    """
+    await _get_user_instance(instance_id, current_user, db)
+    
+    log_dir = settings.INSTANCES_DIR / instance_id / "logs"
+    if log_dir.exists():
+        shutil.rmtree(log_dir, ignore_errors=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Logs gelöscht: id=%s, user_id=%s", instance_id, current_user.id)
+    
+    return {"message": f"Logs for instance {instance_id} deleted successfully"}

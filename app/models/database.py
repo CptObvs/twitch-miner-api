@@ -59,6 +59,8 @@ class MinerInstance(Base):
         server_default=InstanceState.STOPPED.value,
     )
     pid: Mapped[int | None] = mapped_column(nullable=True)  # OS process ID when running
+    enable_analytics: Mapped[bool] = mapped_column(default=False, nullable=False)  # Enable analytics web server
+    analytics_port: Mapped[int | None] = mapped_column(nullable=True)  # Port for analytics web server
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
