@@ -20,10 +20,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from jose import JWTError, jwt
 
+import socketio as _socketio
+
 from app.core.config import settings
 from app.routers import admin, auth, codes, instances, proxy
 from app.services.miner_manager import miner_manager
 from app.routers.proxy import close_http_client
+from app.services.socket_manager import sio
 
 logger = logging.getLogger("uvicorn.error")
 request_logger = logging.getLogger("uvicorn.error")
@@ -190,6 +193,10 @@ app.include_router(admin.router)
 app.include_router(codes.router)
 app.include_router(instances.router)
 app.include_router(proxy.router)
+
+# Socket.IO — mounted at /socket.io (external: /api/socket.io via nginx)
+# socketio_path='' because FastAPI strips the mount prefix before calling the ASGI app
+app.mount("/socket.io", _socketio.ASGIApp(sio, socketio_path=""))
 
 
 @app.get("/", tags=["health"])

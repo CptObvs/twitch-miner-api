@@ -349,17 +349,19 @@ class DockerContainerManager:
     async def reconcile_all_on_startup(self) -> None:
         """Rebuild port map and verify all running containers on startup."""
         async with self._use_db(None) as db:
-            all_instances = (await db.execute(select(MinerInstance))).scalars().all()
+            # Only load non-stopped instances — no need to inspect already-stopped ones
+            non_stopped = (await db.execute(
+                select(MinerInstance).where(MinerInstance.status != InstanceState.STOPPED)
+            )).scalars().all()
 
-            for inst in all_instances:
-                if inst.miner_type == MinerType.TwitchDropsMiner and inst.status != InstanceState.STOPPED and inst.port is not None:
+            if not non_stopped:
+                return
+
+            for inst in non_stopped:
+                if inst.miner_type == MinerType.TwitchDropsMiner and inst.port is not None:
                     self._allocated_ports[inst.id] = inst.port
                     if inst.port >= self._next_port:
                         self._next_port = inst.port + 1
-
-            non_stopped = [i for i in all_instances if i.status != InstanceState.STOPPED]
-            if not non_stopped:
-                return
 
             changed = 0
             for inst in non_stopped:

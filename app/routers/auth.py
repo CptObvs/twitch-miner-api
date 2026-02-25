@@ -31,6 +31,9 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 # Rate limiter
 # ------------------------------------------------------------------
 
+_RATE_LIMITER_MAX_IPS = 10_000
+
+
 class _RateLimiter:
     """Simple in-memory rate limiter: max `limit` requests per `window` seconds per IP."""
 
@@ -43,7 +46,11 @@ class _RateLimiter:
 
     def check(self, ip: str) -> None:
         now = time.monotonic()
-        # Remove expired entries
+        # Evict oldest IP when dict grows too large (prevents memory leak under attack)
+        if len(self._attempts) > _RATE_LIMITER_MAX_IPS and ip not in self._attempts:
+            oldest = next(iter(self._attempts))
+            del self._attempts[oldest]
+        # Remove expired entries for this IP
         self._attempts[ip] = [t for t in self._attempts[ip] if now - t < self.window]
         if len(self._attempts[ip]) >= self.limit:
             raise HTTPException(

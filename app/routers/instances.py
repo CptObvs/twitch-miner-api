@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import shutil
+import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -24,11 +25,28 @@ from app.services.auth import get_current_user, verify_token, oauth2_scheme
 from app.services.miner_manager import miner_manager
 from app.services.activation_log_parser import extract_twitch_activation_from_lines
 from app.services.points import extract_points_from_lines
+from app.services.socket_manager import push_instance_update
 
 router = APIRouter(prefix="/instances", tags=["instances"])
 logger = logging.getLogger("uvicorn.error")
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[mGKH]")
+
+# ------------------------------------------------------------------
+# In-memory caches (avoid repeated log reads)
+# ------------------------------------------------------------------
+
+_POINTS_CACHE_TTL = 30.0   # seconds
+_ACTIVATION_CACHE_TTL = 60.0  # seconds
+
+# instance_id -> (timestamp, data)
+_points_cache: dict[str, tuple[float, list]] = {}
+_activation_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _invalidate_instance_caches(instance_id: str) -> None:
+    _points_cache.pop(instance_id, None)
+    _activation_cache.pop(instance_id, None)
 
 
 # ------------------------------------------------------------------
@@ -94,15 +112,21 @@ async def _fetch_activation(instance: MinerInstance) -> dict[str, str | None]:
     result: dict[str, str | None] = {"activation_url": None, "activation_code": None}
     if instance.miner_type != MinerType.TwitchPointsMinerV2:
         return result
-    
+
+    cached = _activation_cache.get(instance.id)
+    if cached and time.monotonic() - cached[0] < _ACTIVATION_CACHE_TTL:
+        return cached[1]
+
     # For V2 instances, always try to read from output.log file regardless of container status
     lines = await miner_manager.get_recent_logs(
-        instance.container_id or "", 
-        tail=20, 
-        instance_id=instance.id, 
+        instance.container_id or "",
+        tail=20,
+        instance_id=instance.id,
         instance_type=instance.miner_type
     )
-    return extract_twitch_activation_from_lines(lines)
+    result = extract_twitch_activation_from_lines(lines)
+    _activation_cache[instance.id] = (time.monotonic(), result)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -261,6 +285,9 @@ async def start_instance(
 
     await db.refresh(instance)
 
+    # Invalidate caches so next read fetches fresh data after container start
+    _invalidate_instance_caches(instance_id)
+
     activation: dict[str, str | None] = {"activation_url": None, "activation_code": None}
     if instance.miner_type == MinerType.TwitchPointsMinerV2:
         await asyncio.sleep(1)
@@ -273,7 +300,7 @@ async def start_instance(
         "Instance started: id=%s type=%s container=%s",
         instance_id, instance.miner_type, container_id[:12],
     )
-    return InstanceStatus(
+    status_response = InstanceStatus(
         id=instance_id,
         status=InstanceState.RUNNING,
         container_id=container_id,
@@ -281,6 +308,11 @@ async def start_instance(
         activation_url=activation["activation_url"],
         activation_code=activation["activation_code"],
     )
+    asyncio.create_task(push_instance_update(
+        current_user.id,
+        {**status_response.model_dump(), "user_id": current_user.id},
+    ))
+    return status_response
 
 
 @router.post("/{instance_id}/stop", response_model=InstanceStatus)
@@ -294,7 +326,13 @@ async def stop_instance(
     logger.info("Stop requested: id=%s user_id=%s", instance_id, current_user.id)
 
     await miner_manager.stop(instance_id, db_session=db)
-    return InstanceStatus(id=instance_id, status=InstanceState.STOPPED)
+    _invalidate_instance_caches(instance_id)
+    status_response = InstanceStatus(id=instance_id, status=InstanceState.STOPPED)
+    asyncio.create_task(push_instance_update(
+        current_user.id,
+        {**status_response.model_dump(), "user_id": current_user.id},
+    ))
+    return status_response
 
 
 # ------------------------------------------------------------------
@@ -496,22 +534,28 @@ async def get_instance_points_route(
     except Exception:
         pass
 
-    lines: list[str] = []
-    # For V2 instances, always try to read from output.log file regardless of container status
-    if instance.miner_type == MinerType.TwitchPointsMinerV2:
-        lines = await miner_manager.get_recent_logs(
-            instance.container_id or "", 
-            tail=2000, 
-            instance_id=instance.id, 
-            instance_type=instance.miner_type
+    cached = _points_cache.get(instance_id)
+    if cached and time.monotonic() - cached[0] < _POINTS_CACHE_TTL:
+        snapshots = cached[1]
+    else:
+        lines: list[str] = []
+        # For V2 instances, always try to read from output.log file regardless of container status
+        if instance.miner_type == MinerType.TwitchPointsMinerV2:
+            lines = await miner_manager.get_recent_logs(
+                instance.container_id or "",
+                tail=2000,
+                instance_id=instance.id,
+                instance_type=instance.miner_type
+            )
+
+        points = extract_points_from_lines(
+            lines,
+            expected_streamers=set(configured) if configured else None,
         )
+        snapshots = [
+            StreamerPointsSnapshot(streamer=name, channel_points=points.get(name.lower()))
+            for name in configured
+        ]
+        _points_cache[instance_id] = (time.monotonic(), snapshots)
 
-    points = extract_points_from_lines(
-        lines,
-        expected_streamers=set(configured) if configured else None,
-    )
-
-    return [
-        StreamerPointsSnapshot(streamer=name, channel_points=points.get(name.lower()))
-        for name in configured
-    ]
+    return snapshots
