@@ -235,6 +235,24 @@ class DockerContainerManager:
         if not await self._reserve_instance_start(instance_id, db_session=db_session):
             raise RuntimeError(f"Instance {instance_id} is already running or transitioning")
 
+        # Refresh before removing the previous container. An external image update
+        # must also reach the per-user containers created by this API.
+        if miner_type == MinerType.TwitchDropsMiner and settings.DOCKER_PULL_ON_START:
+            try:
+                logger.info("Pulling Drops image %s", settings.DOCKER_IMAGE)
+                rc, _, err = await _run_docker_cmd(
+                    "pull", settings.DOCKER_IMAGE, timeout=settings.DOCKER_PULL_TIMEOUT,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"Unable to pull Drops image {settings.DOCKER_IMAGE}: {err}")
+            except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                await self._update_instance(
+                    instance_id, status=InstanceState.STOPPED, db_session=db_session,
+                )
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise RuntimeError(f"Pulling Drops image {settings.DOCKER_IMAGE} timed out") from exc
+                raise RuntimeError(str(exc)) from exc
+
         container_name = f"miner-{instance_id}"
         await _run_docker_cmd("rm", "-f", container_name, timeout=10)
 
@@ -259,6 +277,9 @@ class DockerContainerManager:
             data_dir.mkdir(parents=True, exist_ok=True)
             cmd = [
                 "run", "-d", "--name", container_name,
+                "--init", "--stop-timeout", str(settings.DOCKER_STOP_TIMEOUT),
+                "--shm-size", "256m",
+                "-e", f"TZ={settings.DOCKER_TIMEZONE}",
                 "-p", f"127.0.0.1:{port}:8080",
                 "-v", f"{data_dir}:/app/data",
                 settings.DOCKER_IMAGE,
@@ -272,7 +293,10 @@ class DockerContainerManager:
         if returncode != 0:
             if port is not None:
                 self._release_port(instance_id)
-            await self._update_instance(instance_id, status=InstanceState.STOPPED, db_session=db_session)
+            await self._update_instance(
+                instance_id, status=InstanceState.STOPPED,
+                container_id=None, port=None, db_session=db_session,
+            )
             raise RuntimeError(stderr)
 
         container_id = stdout

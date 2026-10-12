@@ -1,9 +1,10 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Index, Enum as SQLEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.models.enums import UserRole, InstanceState, MinerType
+from app.core.config import settings
 
 
 class Base(DeclarativeBase):
@@ -77,6 +78,7 @@ class MinerInstance(Base):
 
 class BannedIP(Base):
     __tablename__ = "banned_ips"
+    __table_args__ = (Index("ix_banned_ips_banned_until", "banned_until"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     ip_address: Mapped[str] = mapped_column(String, nullable=False, unique=True)
@@ -87,6 +89,7 @@ class BannedIP(Base):
 
 class ConnectedIP(Base):
     __tablename__ = "connected_ips"
+    __table_args__ = (Index("ix_connected_ips_last_seen_ip", "last_seen", "ip_address"),)
 
     ip_address: Mapped[str] = mapped_column(String, primary_key=True)
     country: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -98,7 +101,7 @@ class ConnectedIP(Base):
 
 # --- Database engine / session ---
 
-engine = create_async_engine("sqlite+aiosqlite:///data/app.db", echo=False)
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

@@ -16,31 +16,24 @@ Regular users can only access their own instances.
 """
 
 import logging
-import re
 from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import MinerInstance, User, get_db
 from app.models.enums import InstanceState
-from app.services.auth import get_current_user, verify_token
+from app.services.auth import verify_token
+from app.services.miner_proxy import HOP_BY_HOP, MinerUIProxy
 
 router = APIRouter(prefix="/instances", tags=["proxy"])
 logger = logging.getLogger("uvicorn.error")
 
 # Shared httpx client (connection-pooled, reused across requests)
 _http_client: httpx.AsyncClient | None = None
-
-# Headers that must not be forwarded (hop-by-hop)
-HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host",
-}
-
 
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
@@ -125,23 +118,18 @@ async def proxy_http(
     port = await _resolve_port(instance_id, current_user, db)
 
     # Forward query string but strip our ?token= param
-    qs_params = {k: v for k, v in request.query_params.items() if k != "token"}
-    qs = "&".join(f"{k}={v}" for k, v in qs_params.items())
+    qs = str(httpx.QueryParams([
+        (k, v) for k, v in request.query_params.multi_items() if k != "token"
+    ]))
     target_url = f"http://127.0.0.1:{port}/{path}"
     if qs:
         target_url += f"?{qs}"
 
-    forward_headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in HOP_BY_HOP
-    }
-    forward_headers["host"] = f"127.0.0.1:{port}"
+    adapter = MinerUIProxy(instance_id, port)
+    forward_headers = adapter.request_headers(request)
 
     client = _get_http_client()
     body = await request.body()
-
-    # Base path for this instance's UI (used to rewrite root-absolute links in HTML)
-    ui_base = f"/api/instances/{instance_id}/ui"
 
     try:
         async with client.stream(
@@ -152,63 +140,24 @@ async def proxy_http(
         ) as upstream:
             response_headers = {
                 k: v for k, v in upstream.headers.items()
-                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+                if k.lower() not in HOP_BY_HOP | {"content-length", "content-encoding", "set-cookie"}
             }
+            if "location" in response_headers:
+                response_headers["location"] = adapter.rewrite_url(response_headers["location"])
             content = await upstream.aread()
             content_type = upstream.headers.get("content-type", "")
 
             # Rewrite root-absolute asset paths in HTML responses so the browser
             # fetches them through the proxy instead of the server root.
             if "text/html" in content_type:
-                html = content.decode("utf-8", errors="replace")
-                # Rewrite root-absolute paths in HTML attributes
-                html = re.sub(r'(href|src|action)="/', rf'\1="{ui_base}/', html)
-                html = re.sub(r"(href|src|action)='/", rf"\1='{ui_base}/", html)
-                html = re.sub(r'url\(/', rf'url({ui_base}/', html)
-
-                # Inject a JS shim before </head> that rewrites root-relative
-                # paths in fetch(), XHR, and WebSocket so the container's JS calls
-                # are routed through the proxy instead of hitting our backend.
-                shim = f"""<script>
-(function(){{
-  var base='{ui_base}';
-  function rw(u){{
-    if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith(base))return base+u;
-    return u;
-  }}
-  // Rewrite HTTP fetch
-  var _f=window.fetch;
-  window.fetch=function(u,o){{return _f(rw(u),o);}};
-  // Rewrite XHR
-  var _o=XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open=function(m,u){{
-    arguments[1]=rw(u);return _o.apply(this,arguments);
-  }};
-  // Rewrite WebSocket (Socket.IO uses absolute wss:// URLs from same host)
-  var _WS=window.WebSocket;
-  function PatchedWS(url,protos){{
-    if(typeof url==='string'){{
-      try{{
-        var u=new URL(url);
-        if(u.hostname===location.hostname&&!u.pathname.startsWith(base)){{
-          u.pathname=base+u.pathname;url=u.toString();
-        }}
-      }}catch(e){{}}
-    }}
-    return protos!==undefined?new _WS(url,protos):new _WS(url);
-  }}
-  PatchedWS.prototype=_WS.prototype;
-  ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(k){{PatchedWS[k]=_WS[k];}});
-  window.WebSocket=PatchedWS;
-}})();
-</script>"""
-                # Inject at the START of <head> so the shim runs before any
-                # scripts (e.g. socket.io) can cache the original WebSocket ref.
-                html = re.sub(r'<head([^>]*)>', lambda m: m.group(0) + shim, html, count=1)
-                if '<head' not in html:
-                    html = shim + html
-                content = html.encode("utf-8")
+                content = adapter.rewrite_html(content.decode("utf-8", errors="replace")).encode("utf-8")
                 response_headers["content-type"] = "text/html; charset=utf-8"
+            elif "javascript" in content_type:
+                content = adapter.rewrite_javascript(content.decode("utf-8", errors="replace")).encode("utf-8")
+
+            if "text/html" in content_type or "javascript" in content_type:
+                response_headers.pop("etag", None)
+                response_headers["cache-control"] = "no-store"
 
             response = Response(
                 content=content,
@@ -217,13 +166,17 @@ async def proxy_http(
                 media_type=upstream.headers.get("content-type"),
             )
 
+            for value in upstream.headers.get_list("set-cookie"):
+                for cookie in adapter.response_cookie(value, request):
+                    response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+
             # Persist token as session cookie so asset requests don't need ?token=
             if token_from_url:
                 response.set_cookie(
                     key=cookie_name,
                     value=jwt_token,
                     httponly=True,
-                    secure=True,
+                    secure=adapter.public_origin(request).startswith("https://"),
                     samesite="lax",
                     path=f"/api/instances/{instance_id}/ui",
                     max_age=3600,
@@ -291,25 +244,36 @@ async def proxy_websocket(
         return
 
     # Build upstream WS URL, forwarding all query params except our token
-    upstream_qs = "&".join(
-        f"{k}={v}"
-        for k, v in websocket.query_params.items()
-        if k != "token"
-    )
+    upstream_qs = str(httpx.QueryParams([
+        (k, v) for k, v in websocket.query_params.multi_items() if k != "token"
+    ]))
     upstream_url = f"ws://127.0.0.1:{port}/{path}"
     if upstream_qs:
         upstream_url += f"?{upstream_qs}"
 
-    await websocket.accept()
+    adapter = MinerUIProxy(instance_id, port)
+    try:
+        upstream_headers = adapter.request_headers(websocket)
+    except HTTPException:
+        await websocket.close(code=4003, reason="Invalid dashboard origin")
+        return
+    # Host is generated by the WebSocket client; avoid a duplicate Host header.
+    upstream_headers.pop("host", None)
+    upstream_headers.pop("sec-websocket-key", None)
+    upstream_headers.pop("sec-websocket-version", None)
+    upstream_headers.pop("sec-websocket-extensions", None)
+    upstream_headers.pop("sec-websocket-protocol", None)
 
     try:
         # python-engineio (Socket.IO) validates that Origin matches Host.
         # Pass the container's own address as Origin so the check passes.
         async with websockets.connect(
             upstream_url,
-            additional_headers={"Origin": f"http://127.0.0.1:{port}"},
+            additional_headers=upstream_headers,
+            subprotocols=websocket.scope.get("subprotocols") or None,
             compression=None,  # disable permessage-deflate to avoid negotiation issues
         ) as upstream_ws:
+            await websocket.accept(subprotocol=upstream_ws.subprotocol)
 
             async def forward_to_upstream():
                 # iter_bytes() only gets binary frames; Socket.IO uses TEXT frames.

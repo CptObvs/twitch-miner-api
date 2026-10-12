@@ -8,7 +8,6 @@ import asyncio
 import gc
 import io
 import logging
-import subprocess
 import sys
 from time import perf_counter
 from contextlib import asynccontextmanager
@@ -22,6 +21,7 @@ from jose import JWTError, jwt
 import socketio as _socketio
 
 from app.core.config import settings
+from app.core.migrations import run_migrations as _run_migrations
 from app.routers import admin, auth, codes, instances, proxy
 from app.services.miner_manager import miner_manager
 from app.routers.proxy import close_http_client
@@ -55,8 +55,11 @@ async def memory_gc_cleanup() -> None:
 async def ip_tracker_flush_loop() -> None:
     while True:
         await asyncio.sleep(30)
-        async with async_session() as db:
-            await ip_tracker_service.flush(db)
+        try:
+            async with async_session() as db:
+                await ip_tracker_service.flush(db)
+        except Exception:
+            logger.exception("IP tracker flush failed; pending records will be retried")
 
 
 def start_background_tasks(app: FastAPI) -> None:
@@ -79,18 +82,6 @@ async def stop_background_tasks(app: FastAPI) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _run_migrations() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        capture_output=True,
-        text=True,
-    )
-    for line in result.stdout.splitlines():
-        logger.info(line)
-    if result.returncode != 0:
-        raise RuntimeError(f"Migration failed:\n{result.stderr}")
-
-
 async def run_startup(app: FastAPI) -> None:
     logger.info("Starting API ...")
     if settings.RUN_MIGRATIONS_ON_STARTUP:
@@ -108,6 +99,12 @@ async def run_startup(app: FastAPI) -> None:
 async def run_shutdown(app: FastAPI) -> None:
     logger.info("Stopping API ...")
     await stop_background_tasks(app)
+    await ip_tracker_service.close()
+    try:
+        async with async_session() as db:
+            await ip_tracker_service.flush(db)
+    except Exception:
+        logger.exception("Final IP tracker flush failed")
     await miner_manager.shutdown_all()
     await close_http_client()
     logger.info("API stopped cleanly")
@@ -182,9 +179,13 @@ async def ip_ban_middleware(request: Request, call_next):
 
     response = await call_next(request)
 
-    if ip and response.status_code == 404 and request.method != "OPTIONS":
-        async with async_session() as db:
-            await ip_ban_service.record_404(ip, db)
+    if (ip and response.status_code == 404 and request.method != "OPTIONS"
+            and request.scope.get("route") is None):
+        # Missing resources at known API/proxy routes are normal user errors.
+        try:
+            await ip_ban_service.record_404(ip, path=request.url.path)
+        except Exception:
+            logger.exception("Failed to persist automatic IP ban")
 
     return response
 

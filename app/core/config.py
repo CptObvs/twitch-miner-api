@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     # Docker
     DOCKER_IMAGE: str = "rangermix/twitch-drops-miner:latest"
     V2_DOCKER_IMAGE: str = "rdavidoff/twitch-channel-points-miner-v2:latest"
+    DOCKER_PULL_ON_START: bool = True
+    DOCKER_PULL_TIMEOUT: int = 300
+    DOCKER_TIMEZONE: str = "Europe/Berlin"
     DOCKER_PORT_BASE: int = 5000
     DOCKER_STOP_TIMEOUT: int = 30
 
@@ -47,6 +51,11 @@ class Settings(BaseSettings):
 
     # Request logging
     API_REQUEST_LOGGING_ENABLED: bool = True
+
+    # Automatic scanner bans (ordinary missing API resources are excluded)
+    IP_BAN_HIT_THRESHOLD: int = Field(default=5, ge=1)
+    IP_BAN_WINDOW_SECONDS: int = Field(default=60, ge=1)
+    IP_BAN_DURATION_HOURS: int = Field(default=1, ge=1)
 
     # Instance limits
     MAX_INSTANCES_PER_USER: int = 2  # Maximum instances for "user" role

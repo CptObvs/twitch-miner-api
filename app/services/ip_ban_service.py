@@ -1,32 +1,40 @@
 """
 IP Ban Service
 ==============
-Tracks 404 hits per IP using a sliding window. After 10 hits within 5 minutes
-the IP is banned for 1 hour. Bans are persisted to the database and cached
-in memory for fast lookups.
+Tracks unknown paths using a bounded sliding window. Scanner probes ban
+immediately; other unknown paths ban after 5 hits in 60 seconds by default.
 """
 
 import logging
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote
+import uuid
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.sqlite import insert
 
-from app.models.database import BannedIP
+from app.core.config import settings
+from app.models.database import BannedIP, async_session
+from app.services.ip_policy import IP_TRACKING_LIMIT, normalize_ip
 
 logger = logging.getLogger("uvicorn.error")
 
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
-_WINDOW_SECONDS = 300   # 5 minutes
-_HIT_THRESHOLD = 10
-_BAN_HOURS = 1
+_BENIGN_PATHS = {"/favicon.ico", "/robots.txt", "/sitemap.xml"}
+_PROBE_ROOTS = ("/.env", "/.git", "/wp-login.php", "/wp-admin", "/xmlrpc.php", "/phpmyadmin")
+
+
+def _is_probe(path: str) -> bool:
+    path = unquote(path).lower().rstrip("/")
+    return any(path == root or path.startswith(root + "/")
+               or (root == "/.env" and path.startswith("/.env.")) for root in _PROBE_ROOTS)
 
 
 class IPBanService:
     def __init__(self) -> None:
         self._banned: dict[str, datetime] = {}
-        self._404_hits: dict[str, deque[datetime]] = defaultdict(deque)
+        self._404_hits: OrderedDict[str, deque[datetime]] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Startup
@@ -34,7 +42,11 @@ class IPBanService:
     async def load_from_db(self, db: AsyncSession) -> None:
         """Load active bans from DB into memory on startup."""
         now = datetime.now(timezone.utc)
-        result = await db.execute(select(BannedIP))
+        await db.execute(delete(BannedIP).where(BannedIP.banned_until <= now))
+        await db.commit()
+        self._banned.clear()
+        self._404_hits.clear()
+        result = await db.execute(select(BannedIP).where(BannedIP.banned_until > now))
         for row in result.scalars().all():
             banned_until = row.banned_until
             if banned_until.tzinfo is None:
@@ -48,7 +60,7 @@ class IPBanService:
 
     def is_banned(self, ip: str) -> bool:
         """Sync check — returns True if the IP is currently banned."""
-        if ip in _LOOPBACK:
+        if (ip := normalize_ip(ip)) is None:
             return False
         banned_until = self._banned.get(ip)
         if banned_until is None:
@@ -64,14 +76,25 @@ class IPBanService:
     # ------------------------------------------------------------------
     # Record
 
-    async def record_404(self, ip: str, db: AsyncSession) -> None:
+    async def record_404(self, ip: str, db: AsyncSession | None = None, *, path: str = "") -> None:
         """Record a 404 hit for an IP. Bans the IP if the threshold is reached."""
-        if ip in _LOOPBACK:
+        if (ip := normalize_ip(ip)) is None or path in _BENIGN_PATHS or self.is_banned(ip):
             return
 
         now = datetime.now(timezone.utc)
-        window_start = now - timedelta(seconds=_WINDOW_SECONDS)
+        window_start = now - timedelta(seconds=settings.IP_BAN_WINDOW_SECONDS)
+        # Ordered by the most recent hit, so old entries can be pruned cheaply.
+        while self._404_hits:
+            oldest = next(iter(self._404_hits))
+            if self._404_hits[oldest][-1] >= window_start:
+                break
+            self._404_hits.popitem(last=False)
+        if ip not in self._404_hits:
+            if len(self._404_hits) >= IP_TRACKING_LIMIT:
+                self._404_hits.popitem(last=False)
+            self._404_hits[ip] = deque()
         hits = self._404_hits[ip]
+        self._404_hits.move_to_end(ip)
 
         # Prune hits outside the window
         while hits and hits[0] < window_start:
@@ -79,15 +102,20 @@ class IPBanService:
 
         hits.append(now)
 
-        if len(hits) >= _HIT_THRESHOLD:
-            banned_until = now + timedelta(hours=_BAN_HOURS)
+        if _is_probe(path) or len(hits) >= settings.IP_BAN_HIT_THRESHOLD:
+            banned_until = now + timedelta(hours=settings.IP_BAN_DURATION_HOURS)
             hit_count = len(hits)
             self._banned[ip] = banned_until
             self._404_hits.pop(ip, None)
-            await self._persist_ban(ip, now, banned_until, hit_count, db)
+            # Ordinary 404s require no database session or write.
+            if db is not None:
+                await self._persist_ban(ip, now, banned_until, hit_count, db)
+            else:
+                async with async_session() as ban_db:
+                    await self._persist_ban(ip, now, banned_until, hit_count, ban_db)
             logger.warning(
                 "IP ban service: banned %s for %dh after %d 404 hits in %ds",
-                ip, _BAN_HOURS, hit_count, _WINDOW_SECONDS,
+                ip, settings.IP_BAN_DURATION_HOURS, hit_count, settings.IP_BAN_WINDOW_SECONDS,
             )
 
     async def _persist_ban(
@@ -98,13 +126,13 @@ class IPBanService:
         hit_count: int,
         db: AsyncSession,
     ) -> None:
-        # Upsert: delete existing row (if any) then insert fresh
-        await db.execute(delete(BannedIP).where(BannedIP.ip_address == ip))
-        db.add(BannedIP(
-            ip_address=ip,
-            banned_at=banned_at,
-            banned_until=banned_until,
-            hit_count=hit_count,
+        stmt = insert(BannedIP).values(
+            id=str(uuid.uuid4()), ip_address=ip, banned_at=banned_at,
+            banned_until=banned_until, hit_count=hit_count,
+        )
+        await db.execute(stmt.on_conflict_do_update(
+            index_elements=[BannedIP.ip_address],
+            set_={"banned_at": banned_at, "banned_until": banned_until, "hit_count": hit_count},
         ))
         await db.commit()
 
@@ -114,20 +142,12 @@ class IPBanService:
     async def get_active_bans(self, db: AsyncSession) -> list[BannedIP]:
         """Return all bans whose banned_until is in the future."""
         now = datetime.now(timezone.utc)
-        result = await db.execute(select(BannedIP))
-        rows = result.scalars().all()
-        active = []
-        for row in rows:
-            banned_until = row.banned_until
-            if banned_until.tzinfo is None:
-                banned_until = banned_until.replace(tzinfo=timezone.utc)
-            if banned_until > now:
-                active.append(row)
-        return active
+        result = await db.execute(select(BannedIP).where(BannedIP.banned_until > now))
+        return list(result.scalars().all())
 
     async def ban(self, ip: str, duration_hours: int, db: AsyncSession) -> None:
         """Manually ban an IP for the given duration."""
-        if ip in _LOOPBACK:
+        if (ip := normalize_ip(ip)) is None:
             return
         now = datetime.now(timezone.utc)
         banned_until = now + timedelta(hours=duration_hours)
@@ -138,6 +158,8 @@ class IPBanService:
 
     async def unban(self, ip: str, db: AsyncSession) -> bool:
         """Remove a ban for the given IP. Returns True if a ban was found."""
+        if (ip := normalize_ip(ip)) is None:
+            return False
         result = await db.execute(select(BannedIP).where(BannedIP.ip_address == ip))
         row = result.scalar_one_or_none()
         if row is None:

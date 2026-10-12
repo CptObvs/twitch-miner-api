@@ -292,7 +292,7 @@ async def list_connected_ips(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[ConnectedIPResponse]:
     """
-    List all unique IPs that have ever connected, ordered by most recent activity.
+    List the 1,000 most recently active IPs.
 
     Only ADMIN users can access this endpoint.
     """

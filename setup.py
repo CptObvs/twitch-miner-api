@@ -20,18 +20,16 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 import argparse
-from alembic.config import Config as AlembicConfig
-from alembic import command as alembic_command
 from sqlalchemy import select
 from app.models.database import User, async_session
 from app.models.enums import UserRole
 from app.services.auth import hash_password
 from app.services.registration import create_registration_code
+from app.core.migrations import run_migrations
 
 
 def _alembic_upgrade() -> None:
-    cfg = AlembicConfig("alembic.ini")
-    alembic_command.upgrade(cfg, "head")
+    run_migrations()
 
 
 async def create_admin_user(username: str = "admin", password: str = "testpass123"):
