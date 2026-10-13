@@ -23,6 +23,16 @@ Auf dem Server den geänderten API-Code übernehmen, in der tatsächlich geladen
 
 Falls der Server über `scripts/start-prod.sh` startet: Dieses Script setzt den Checkout auf den Stand von `origin` zurück. Die Änderungen müssen deshalb vor diesem Start committed und zum verwendeten Remote-Branch gepusht sein.
 
+### HTTPS-Reverse-Proxy und Fehler 403 beim Login
+
+Wenn die API hinter einem HTTPS-Proxy intern per HTTP angesprochen wird, kann der Browser-Login mit `Invalid dashboard origin` und WebSocket-Code 1006 scheitern. In der tatsächlich geladenen Server-Umgebung die öffentliche Origin setzen und die API neu starten:
+
+```dotenv
+UI_PUBLIC_ORIGIN=https://miner.noxiousgaming.eu
+```
+
+Das ist nur Schema plus Domain und gegebenenfalls Port, ohne `/api`, Instanz-Pfad oder Token. Die feste Origin wird für HTTP und WebSocket sowie für sichere Cookies verwendet. Andere Origins werden weiterhin abgelehnt. Wenn der Reverse-Proxy `Host` und `X-Forwarded-Proto` korrekt weitergibt, ist die Einstellung optional. Der Proxy muss WebSocket-Upgrades auch für den Instanz-Pfad `/api/session/vnc` durchreichen.
+
 Die neuen Container verwenden `--init`, 256 MiB Shared Memory und die konfigurierte Stop-Wartezeit. `DOCKER_TIMEZONE` ist standardmäßig `Europe/Berlin` und muss zur Zeitzone des Internetanschlusses des Miner-Servers passen. Der Browser-Login nutzt denselben authentifizierten UI-Proxy: HTTP-Origins, Login-Weiterleitungen, noVNC-Module und binäre WebSocket-Daten werden weitergeleitet. Dashboard-Cookies sind auf die jeweilige Instanz beschränkt; Backend-JWTs gelangen nicht zum Miner. Ein bestehender zusätzlicher Dashboard-Passwortschutz funktioniert weiterhin. Der native Desktop-Helper benötigt eine direkt erreichbare Miner-Adresse; er unterstützt den zusätzlichen API-Login und den Instanz-Unterpfad nicht.
 
 ## IP-Tracking und automatische Bans

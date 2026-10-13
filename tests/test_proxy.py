@@ -15,6 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.models.database import MinerInstance, get_db
 from app.models.enums import InstanceState
 from app.routers import proxy
+from app.core.config import Settings, settings
 
 
 @pytest_asyncio.fixture
@@ -104,6 +105,33 @@ async def test_https_termination_and_backend_credentials(proxy_setup):
     assert sent["cookie"] == "tdm_session=miner-session"
 
 
+async def test_public_https_origin_behind_http_gateway(proxy_setup, monkeypatch):
+    browser, token, requests, _ = proxy_setup
+    monkeypatch.setattr(settings, "UI_PUBLIC_ORIGIN", "https://public.test")
+    response = await browser.post(
+        f"http://public.test/api/instances/one/ui/api/session/finish?token={token}",
+        headers={"Origin": "https://public.test", "X-TDM-Request": "1"},
+    )
+    assert response.status_code == 200
+    assert requests[-1].headers["origin"] == "http://127.0.0.1:5000"
+    assert "Secure" in response.headers["set-cookie"]
+    response = await browser.post(
+        f"http://public.test/api/instances/one/ui/api/session/finish?token={token}",
+        headers={"Origin": "https://attacker.test", "X-TDM-Request": "1"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("value", ["https://user:pass@example.com", "https://example.com/api", "https://example.com?token=secret", "https://example.com#fragment", "ftp://example.com", "https://example.com/ "])
+def test_public_origin_rejects_invalid_configuration(value):
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, UI_PUBLIC_ORIGIN=value)
+
+
+def test_public_origin_normalizes_default_port_and_trailing_slash():
+    assert Settings(_env_file=None, UI_PUBLIC_ORIGIN="https://EXAMPLE.com:443/").UI_PUBLIC_ORIGIN == "https://example.com"
+
+
 async def test_query_roundtrip_and_redirects(proxy_setup):
     browser, token, requests, handlers = proxy_setup
     handlers["request"] = lambda r: httpx.Response(303, headers={"location": "/login?next=%2F"})
@@ -149,7 +177,10 @@ async def test_proxy_still_checks_instance_ownership(proxy_setup, admin_user):
     assert not requests
 
 
-async def test_vnc_websocket_relays_cookies_subprotocol_and_binary_frames(monkeypatch):
+@pytest.mark.parametrize("tls_gateway", [False, True])
+async def test_vnc_websocket_relays_cookies_subprotocol_and_binary_frames(monkeypatch, tls_gateway):
+    if tls_gateway:
+        monkeypatch.setattr(settings, "UI_PUBLIC_ORIGIN", "https://public.test")
     app = FastAPI()
     app.include_router(proxy.router, prefix="/api")
 
@@ -173,7 +204,7 @@ async def test_vnc_websocket_relays_cookies_subprotocol_and_binary_frames(monkey
         def browser_session():
             with TestClient(app) as browser:
                 with browser.websocket_connect(
-                    "wss://public.test/api/instances/one/ui/api/session/vnc?value=a%26b&value=c",
+                    ("ws" if tls_gateway else "wss") + "://public.test/api/instances/one/ui/api/session/vnc?value=a%26b&value=c",
                     headers={"Origin": "https://public.test", "Cookie": "proxy_token_one=backend-jwt; tdm_session=miner-session"},
                     subprotocols=["binary"],
                 ) as ws:

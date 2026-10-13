@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 from starlette.requests import HTTPConnection
+from app.core.config import settings
 
 
 HOP_BY_HOP = {
@@ -22,6 +23,8 @@ class MinerUIProxy:
 
     @staticmethod
     def public_origin(connection: HTTPConnection) -> str:
+        if settings.UI_PUBLIC_ORIGIN:
+            return settings.UI_PUBLIC_ORIGIN
         # TLS may terminate at the existing Apache/nginx proxy.
         scheme = connection.headers.get("x-forwarded-proto", connection.url.scheme)
         scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
